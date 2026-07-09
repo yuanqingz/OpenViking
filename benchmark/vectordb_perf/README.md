@@ -3,7 +3,7 @@
 这个 benchmark 用来快速验收新的 VectorDB storage backend 在 OpenViking 场景下的表现。
 它不直接调用 `CollectionAdapter`，而是走 `VikingVectorIndexBackend`：
 
-- 建表使用 `CollectionSchemas.context_collection`
+- 建表使用与 `CollectionSchemas.context_collection` 相同的轻依赖 schema builder
 - 写入使用 `VikingVectorIndexBackend.upsert(..., ctx=...)`
 - 查询使用 `VikingVectorIndexBackend.search_in_tenant(...)`
 - 目录范围使用 `target_directories`，内部会编译成 `PathScope("uri", ..., depth=-1)`
@@ -29,7 +29,8 @@ dir-vector-dataset 的 `.fvecs` 文件。
 | 压力 stress | `--profile stress` | 生成 100000 行、500 个 query | 抽样前 100000 行、前 500 个 query |
 | 全量真实数据 | `--workload dir-vector --full` | 不适用 | 读取 dataset 全量 corpus 和 query |
 
-`--rows`、`--queries`、`--batch-size`、`--concurrency`、`--top-k` 可以覆盖 profile 默认值。
+`--rows`、`--queries`、`--batch-size`、`--concurrency`、`--warmup-queries`、`--top-k`
+可以覆盖 profile 默认值。
 `--full` 只对 `dir-vector` 生效；真实数据的向量维度从 `.fvecs` 读取，`--dim` 只影响 synthetic。
 
 ## 再选读写阶段
@@ -186,11 +187,17 @@ runner 会把配置里的 `name` 改成 `<name>_bench_<run-id>`，避免覆盖�
 | `setup` | 创建 collection 和索引 schema |
 | `ingest` | 通过 backend upsert OV context row |
 | `validate` | count、get、过滤 count |
+| `vector_search_cold` / `filtered_vector_search_cold` | 单独记录每类 search 的首个请求 |
+| `vector_search_warmup` / `filtered_vector_search_warmup` | 不计入正式 QPS/延迟的其余暖机 query |
 | `vector_search` | `search_in_tenant`，无指定目录 |
 | `filtered_vector_search` | `search_in_tenant`，带 `target_directories` |
 | `cleanup` | 仅在传 `--drop-at-end` 时删除测试 collection |
 
 功能错误会导致非零退出码；性能慢只记录到报告里。
+
+cold/warmup phase 会单独写入事件和性能汇总，但“召回与 QPS”表只读取正式 search phase。
+报告还会通过 backend count 记录首个 query filter 的 eligible count 和实际选择率，避免把
+`--filter-selectivity` 的目标值误当成离散目录结构下的实际值。
 
 `--mode write-only` 只会出现 `setup` / `ingest` / 可选 `cleanup` 阶段。
 `--mode read-only` 只会出现 `validate` / `vector_search` / `filtered_vector_search` 阶段。
@@ -295,6 +302,7 @@ Volcengine VikingDB：
 | `--dim` | synthetic 向量维度 |
 | `--batch-size` | upsert 批大小 |
 | `--concurrency` | 查询并发 |
+| `--warmup-queries` | 每个 search phase 正式计时前执行的暖机 query 数；设为 `0` 可关闭 |
 | `--top-k` | 检索返回条数 |
 | `--distance` | `ip`、`l2`、`cosine` |
 | `--drop-at-end` | 运行结束后删除测试 collection |
@@ -312,11 +320,12 @@ Volcengine VikingDB：
 | `environment.json` | runner 本机环境观测 |
 | `run_config.json` | 本次运行参数 |
 
-`summary_zh.md` 里重点看两张表：
+`summary_zh.md` 里重点看三张表：
 
 | 表 | 内容 |
 | --- | --- |
 | 数据规模 | `records` 是本次计划读取的数据条数，`inserted` 是实际写入 backend 的条数，`queries` 是实际查询数 |
+| 过滤范围样本 | 首个 query filter 的 eligible count、目标选择率和 backend 实测选择率 |
 | 召回与 QPS | `vector_search` 和 `filtered_vector_search` 的 QPS、平均延迟、P95 延迟、gt_recall@K |
 
 gt_recall@K 按 query 的 ground truth 命中率统计。`--full` 才是官方全量 recall；

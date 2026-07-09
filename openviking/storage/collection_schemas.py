@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional
 
 from openviking.models.embedder.base import EmbedResult, embed_compat
 from openviking.server.identity import RequestContext, Role
+from openviking.storage.context_schema import build_context_collection_schema
 from openviking.storage.errors import (
     CollectionNotFoundError,
     EmbeddingConfigurationError,
@@ -74,77 +75,7 @@ class CollectionSchemas:
         Returns:
             Schema definition for the context collection
         """
-        fields = [
-            {"FieldName": "id", "FieldType": "string", "IsPrimaryKey": True},
-            {"FieldName": "uri", "FieldType": "path"},
-            # type 字段：当前版本未使用，保留用于未来扩展
-            # 预留用于表示资源的具体类型，如 "file", "directory", "image", "video", "repository" 等
-            {"FieldName": "type", "FieldType": "string"},
-            # context_type 字段：区分上下文的大类
-            # 枚举值："resource"（资源，默认）, "memory"（记忆）, "skill"（技能）
-            # 推导规则：
-            #   - URI 位于 user skills 目录下 → "skill"
-            #   - URI 包含 "memories" → "memory"
-            #   - 其他情况 → "resource"
-            {"FieldName": "context_type", "FieldType": "string"},
-            {"FieldName": "vector", "FieldType": "vector", "Dim": vector_dim},
-            {"FieldName": "sparse_vector", "FieldType": "sparse_vector"},
-            {"FieldName": "created_at", "FieldType": "date_time"},
-            {"FieldName": "updated_at", "FieldType": "date_time"},
-            {"FieldName": "active_count", "FieldType": "int64"},
-        ]
-        fields.extend(
-            [
-                # level 字段：区分 L0/L1/L2 层级
-                # 枚举值：
-                #   - 0 = L0（abstract，摘要）
-                #   - 1 = L1（overview，概览）
-                #   - 2 = L2（detail/content，详情/内容，默认）
-                # URI 命名规则：
-                #   - level=0: {目录}/.abstract.md
-                #   - level=1: {目录}/.overview.md
-                #   - level=2: {文件路径}
-                {"FieldName": "level", "FieldType": "int64"},
-                {"FieldName": "name", "FieldType": "string"},
-                {"FieldName": "description", "FieldType": "string"},
-                {"FieldName": "tags", "FieldType": "string"},
-                {"FieldName": "search_tags", "FieldType": "list<string>"},
-                {"FieldName": "abstract", "FieldType": "string"},
-                {"FieldName": "content", "FieldType": "text"},
-                {"FieldName": "account_id", "FieldType": "string"},
-                {"FieldName": "owner_user_id", "FieldType": "string"},
-            ]
-        )
-        scalar_index = [
-            "uri",
-            "type",
-            "context_type",
-            "created_at",
-            "updated_at",
-            "active_count",
-        ]
-        scalar_index.extend(
-            [
-                "level",
-                "name",
-                "tags",
-                "search_tags",
-                "account_id",
-                "owner_user_id",
-            ]
-        )
-        return {
-            "CollectionName": name,
-            "Description": description or "Unified context collection",
-            "Fields": fields,
-            "ScalarIndex": scalar_index,
-            "FullText": [
-                {
-                    "Field": "content",
-                    "Analyzer": {"Tokenizer": "standard", "StopWordsFilters": ["symbol"]},
-                },
-            ],
-        }
+        return build_context_collection_schema(name, vector_dim, description)
 
 
 def _get_active_embedding_model_config(config: "OpenVikingConfig") -> Any:

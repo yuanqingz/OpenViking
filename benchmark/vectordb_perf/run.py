@@ -27,16 +27,13 @@ import uuid
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Callable, Iterable, Iterator, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, Optional, Sequence
 
 from benchmark.vectordb_perf.async_utils import map_bounded_as_completed
 
-from openviking.storage.expr import PathScope
-from openviking.server.identity import RequestContext, Role
-from openviking.storage.collection_schemas import CollectionSchemas
-from openviking.storage.viking_vector_index_backend import VikingVectorIndexBackend
-from openviking_cli.session.user_id import UserIdentifier
-from openviking_cli.utils.config import OpenVikingConfigSingleton
+if TYPE_CHECKING:
+    from openviking.server.identity import RequestContext
+    from openviking.storage.viking_vector_index_backend import VikingVectorIndexBackend
 
 
 BENCH_ACCOUNT_ID = "bench_account"
@@ -53,6 +50,7 @@ PROFILE_DEFAULTS: dict[str, dict[str, Any]] = {
         "dim": 32,
         "batch_size": 32,
         "concurrency": 1,
+        "warmup_queries": 1,
         "top_k": 10,
         "path_depth": 4,
         "path_fanout": 4,
@@ -64,6 +62,7 @@ PROFILE_DEFAULTS: dict[str, dict[str, Any]] = {
         "dim": 1024,
         "batch_size": 500,
         "concurrency": 4,
+        "warmup_queries": 5,
         "top_k": 20,
         "path_depth": 6,
         "path_fanout": 8,
@@ -75,6 +74,7 @@ PROFILE_DEFAULTS: dict[str, dict[str, Any]] = {
         "dim": 1024,
         "batch_size": 1000,
         "concurrency": 8,
+        "warmup_queries": 10,
         "top_k": 100,
         "path_depth": 8,
         "path_fanout": 10,
@@ -123,6 +123,7 @@ class BenchOptions:
     dim: int
     batch_size: int
     concurrency: int
+    warmup_queries: int
     top_k: int
     path_depth: int
     path_fanout: int
@@ -421,6 +422,22 @@ def path_matches(path_value: Any, prefix: str) -> bool:
     return False
 
 
+def build_filter_scope_sample(
+    *,
+    filter_path: str,
+    eligible_count: int,
+    total_count: int,
+    requested_selectivity: Optional[float],
+) -> dict[str, Any]:
+    return {
+        "filter_path": filter_path,
+        "eligible_count": eligible_count,
+        "total_count": total_count,
+        "actual_selectivity": eligible_count / total_count if total_count else None,
+        "requested_selectivity": requested_selectivity,
+    }
+
+
 def synthetic_vector(rng: random.Random, dim: int) -> list[float]:
     return [rng.uniform(-1.0, 1.0) for _ in range(dim)]
 
@@ -691,10 +708,14 @@ def dir_vector_paths(dataset_root: Optional[Path], dataset: str) -> dict[str, Pa
 
 
 def build_schema(collection_name: str, dim: int) -> dict[str, Any]:
-    return CollectionSchemas.context_collection(collection_name, dim)
+    from openviking.storage.context_schema import build_context_collection_schema
+
+    return build_context_collection_schema(collection_name, dim)
 
 
 def load_backend_config(options: BenchOptions, collection_name: Optional[str] = None):
+    from openviking_cli.utils.config import OpenVikingConfigSingleton
+
     OpenVikingConfigSingleton.reset_instance()
     config = OpenVikingConfigSingleton.initialize(config_path=options.config)
     vectordb = config.storage.vectordb.model_copy(deep=True)
@@ -831,12 +852,70 @@ async def run_search_phase(
     return events, validation_errors, quality
 
 
+async def run_search_with_warmup(
+    *,
+    backend: VikingVectorIndexBackend,
+    ctx: RequestContext,
+    phase: str,
+    queries: list[QueryCase],
+    top_k: int,
+    concurrency: int,
+    warmup_queries: int,
+    filtered: bool,
+) -> tuple[list[Event], list[Event], list[str], dict[str, Any]]:
+    """Run labelled cold/warmup requests before the measured search phase."""
+
+    warmup_events: list[Event] = []
+    validation_errors: list[str] = []
+    warmup_count = min(len(queries), max(0, warmup_queries))
+    if warmup_count:
+        cold_events, cold_errors, _ = await run_search_phase(
+            backend=backend,
+            ctx=ctx,
+            phase=f"{phase}_cold",
+            queries=queries[:1],
+            top_k=top_k,
+            concurrency=1,
+            filtered=filtered,
+        )
+        warmup_events.extend(cold_events)
+        validation_errors.extend(cold_errors)
+
+        if warmup_count > 1:
+            extra_warmup_events, warmup_errors, _ = await run_search_phase(
+                backend=backend,
+                ctx=ctx,
+                phase=f"{phase}_warmup",
+                queries=queries[1:warmup_count],
+                top_k=top_k,
+                concurrency=concurrency,
+                filtered=filtered,
+            )
+            warmup_events.extend(extra_warmup_events)
+            validation_errors.extend(warmup_errors)
+
+    measured_events, measured_errors, quality = await run_search_phase(
+        backend=backend,
+        ctx=ctx,
+        phase=phase,
+        queries=queries,
+        top_k=top_k,
+        concurrency=concurrency,
+        filtered=filtered,
+    )
+    validation_errors.extend(measured_errors)
+    return warmup_events, measured_events, validation_errors, quality
+
+
 def result_hits_ground_truth(rows: list[dict[str, Any]], ground_truth_ids: list[str]) -> bool:
     returned_ids = {str(row.get("id")) for row in rows if row.get("id") is not None}
     return any(str(item) in returned_ids for item in ground_truth_ids)
 
 
 def benchmark_context() -> RequestContext:
+    from openviking.server.identity import RequestContext, Role
+    from openviking_cli.session.user_id import UserIdentifier
+
     return RequestContext(user=UserIdentifier(BENCH_ACCOUNT_ID, BENCH_USER_ID), role=Role.USER)
 
 
@@ -880,6 +959,9 @@ def run_benchmark_suite(options: BenchOptions) -> list[tuple[BenchOptions, RunRe
 
 
 async def run_benchmark_async(options: BenchOptions) -> RunResult:
+    from openviking.storage.expr import PathScope
+    from openviking.storage.viking_vector_index_backend import VikingVectorIndexBackend
+
     workload = (
         build_synthetic_workload(options)
         if options.workload == "synthetic"
@@ -1021,34 +1103,38 @@ async def run_benchmark_async(options: BenchOptions) -> RunResult:
         validation_errors.append(f"fetch_by_ids returned {len(fetched or [])}, expected {len(fetch_ids)}")
 
     selected_queries = workload.queries
-    search_events, errors, vector_quality = await run_search_phase(
+    warmup_events, search_events, errors, vector_quality = await run_search_with_warmup(
         backend=backend,
         ctx=ctx,
         phase="vector_search",
         queries=selected_queries,
         top_k=options.top_k,
         concurrency=options.concurrency,
+        warmup_queries=options.warmup_queries,
         filtered=False,
     )
+    events.extend(warmup_events)
     events.extend(search_events)
     validation_errors.extend(errors)
     quality["vector_search"] = vector_quality
 
-    filtered_events, errors, filtered_quality = await run_search_phase(
+    warmup_events, filtered_events, errors, filtered_quality = await run_search_with_warmup(
         backend=backend,
         ctx=ctx,
         phase="filtered_vector_search",
         queries=selected_queries,
         top_k=options.top_k,
         concurrency=options.concurrency,
+        warmup_queries=options.warmup_queries,
         filtered=True,
     )
+    events.extend(warmup_events)
     events.extend(filtered_events)
     validation_errors.extend(errors)
     quality["filtered_vector_search"] = filtered_quality
 
     first_filter = selected_queries[0].filter_path
-    event, _ = await async_timed_event(
+    event, filtered_count_result = await async_timed_event(
         "validate",
         "count_filtered",
         lambda: backend.count(PathScope("uri", first_filter, depth=-1), ctx=ctx),
@@ -1057,6 +1143,25 @@ async def run_benchmark_async(options: BenchOptions) -> RunResult:
     events.append(event)
     if not event.success:
         validation_errors.append(event.error or "count_filtered failed")
+    else:
+        eligible_count = int(filtered_count_result or 0)
+        total_count = int(count_result or 0) if count_result is not None else 0
+        filter_scope_sample = build_filter_scope_sample(
+            filter_path=first_filter,
+            eligible_count=eligible_count,
+            total_count=total_count,
+            requested_selectivity=options.filter_selectivity
+            if options.workload == "synthetic"
+            else None,
+        )
+        event.extra.update(
+            {
+                "eligible_count": eligible_count,
+                "total_count": total_count,
+                "actual_selectivity": filter_scope_sample["actual_selectivity"],
+            }
+        )
+        quality["filter_scope_sample"] = filter_scope_sample
 
     if options.drop_at_end:
         progress("cleanup: drop collection")
@@ -1112,6 +1217,10 @@ def finalize_result(
             "query_count": len(workload.queries),
             "vector_dim": workload.dim,
             "top_k": options.top_k,
+            "warmup_queries": options.warmup_queries,
+            "requested_filter_selectivity": options.filter_selectivity
+            if options.workload == "synthetic"
+            else None,
             "full": options.full,
             "profile": options.profile,
         },
@@ -1305,6 +1414,12 @@ def write_suite_outputs(
                 run_summaries[run_options.dataset], "filtered_vector_search", "throughput_per_sec"
             ),
             "filtered_recall": quality_rate(result.quality, "filtered_vector_search"),
+            "filter_eligible": result.quality.get("filter_scope_sample", {}).get(
+                "eligible_count", "-"
+            ),
+            "actual_filter_selectivity": percent_value(
+                result.quality.get("filter_scope_sample", {}).get("actual_selectivity")
+            ),
             "recall_scope": recall_scope(result),
             "summary": str(Path(result.output_dir) / "summary_zh.md"),
             "collection": result.collection_name,
@@ -1359,6 +1474,12 @@ def quality_rate(quality: dict[str, Any], phase: str) -> str:
     return f"{float(value) * 100.0:.2f}%"
 
 
+def percent_value(value: Any) -> str:
+    if value is None:
+        return "-"
+    return f"{float(value) * 100.0:.4f}%"
+
+
 def recall_scope(result: RunResult) -> str:
     if result.workload.get("workload") == "dir-vector" and not result.workload.get("full"):
         return "sampled_subset"
@@ -1377,7 +1498,24 @@ def workload_rows(result: RunResult, summary_rows: list[dict[str, Any]]) -> list
             "queries": workload.get("query_count"),
             "dim": workload.get("vector_dim"),
             "top_k": workload.get("top_k"),
+            "warmup_queries": workload.get("warmup_queries"),
             "full": workload.get("full"),
+        }
+    ]
+
+
+def filter_scope_rows(result: RunResult) -> list[dict[str, Any]]:
+    sample = result.quality.get("filter_scope_sample", {})
+    if not sample:
+        return []
+    return [
+        {
+            "scope": "first_query_filter",
+            "eligible": sample.get("eligible_count"),
+            "total": sample.get("total_count"),
+            "requested_selectivity": percent_value(sample.get("requested_selectivity")),
+            "actual_selectivity": percent_value(sample.get("actual_selectivity")),
+            "filter_path": sample.get("filter_path"),
         }
     ]
 
@@ -1435,6 +1573,12 @@ def build_markdown_report(
             "## 数据规模",
             "",
             markdown_table(workload_rows(result, summary_rows)),
+            "",
+            "## 过滤范围样本",
+            "",
+            markdown_table(filter_scope_rows(result)),
+            "",
+            "实际选择率使用首个 query 的 filter，通过 backend count 统计；不会用配置的目标选择率代替。",
             "",
             "## 召回与 QPS",
             "",
@@ -1543,6 +1687,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> BenchOptions:
     parser.add_argument("--dim", type=int)
     parser.add_argument("--batch-size", type=int)
     parser.add_argument("--concurrency", type=int)
+    parser.add_argument(
+        "--warmup-queries",
+        type=int,
+        help="Queries per search phase to run before measured requests",
+    )
     parser.add_argument("--top-k", type=int)
     parser.add_argument("--path-depth", type=int)
     parser.add_argument("--path-fanout", type=int)
@@ -1573,6 +1722,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> BenchOptions:
         dim=args.dim if args.dim is not None else defaults["dim"],
         batch_size=args.batch_size if args.batch_size is not None else defaults["batch_size"],
         concurrency=args.concurrency if args.concurrency is not None else defaults["concurrency"],
+        warmup_queries=args.warmup_queries
+        if args.warmup_queries is not None
+        else defaults["warmup_queries"],
         top_k=args.top_k if args.top_k is not None else defaults["top_k"],
         path_depth=args.path_depth if args.path_depth is not None else defaults["path_depth"],
         path_fanout=args.path_fanout if args.path_fanout is not None else defaults["path_fanout"],
