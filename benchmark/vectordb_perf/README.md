@@ -10,6 +10,8 @@
 
 它仍然不经过 OpenViking Server、AGFS、embedding 服务和 rerank；向量直接来自模拟数据或
 dir-vector-dataset 的 `.fvecs` 文件。
+runner 只读取并校验 `storage.vectordb` 子配置，不会初始化或校验未参与 benchmark 的
+embedding/VLM provider。
 
 ## 先选模式
 

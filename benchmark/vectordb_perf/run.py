@@ -713,12 +713,34 @@ def build_schema(collection_name: str, dim: int) -> dict[str, Any]:
     return build_context_collection_schema(collection_name, dim)
 
 
-def load_backend_config(options: BenchOptions, collection_name: Optional[str] = None):
-    from openviking_cli.utils.config import OpenVikingConfigSingleton
+def vectordb_config_payload(config_data: dict[str, Any]) -> dict[str, Any]:
+    storage = config_data.get("storage", {})
+    if not isinstance(storage, dict):
+        raise ValueError("storage config must be an object")
+    vectordb = storage.get("vectordb", {})
+    if not isinstance(vectordb, dict):
+        raise ValueError("storage.vectordb config must be an object")
 
-    OpenVikingConfigSingleton.reset_instance()
-    config = OpenVikingConfigSingleton.initialize(config_path=options.config)
-    vectordb = config.storage.vectordb.model_copy(deep=True)
+    payload = dict(vectordb)
+    workspace = Path(str(storage.get("workspace", "./data"))).expanduser().resolve()
+    payload["path"] = str(workspace)
+    return payload
+
+
+def load_backend_config(options: BenchOptions, collection_name: Optional[str] = None):
+    from openviking_cli.utils.config.config_loader import require_config
+    from openviking_cli.utils.config.consts import DEFAULT_OV_CONF, OPENVIKING_CONFIG_ENV
+    from openviking_cli.utils.config.vectordb_config import VectorDBBackendConfig
+
+    config_data = require_config(
+        options.config,
+        OPENVIKING_CONFIG_ENV,
+        DEFAULT_OV_CONF,
+        "VectorDB benchmark",
+    )
+    payload = vectordb_config_payload(config_data)
+    Path(payload["path"]).mkdir(parents=True, exist_ok=True)
+    vectordb = VectorDBBackendConfig.model_validate(payload)
     if collection_name is not None:
         vectordb.name = collection_name
     return vectordb

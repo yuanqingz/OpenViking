@@ -1,6 +1,8 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 # SPDX-License-Identifier: AGPL-3.0
 
+import pytest
+
 from benchmark.vectordb_perf import run as benchmark
 
 
@@ -97,3 +99,32 @@ def test_dependency_light_context_schema_has_required_vector_and_filter_fields()
     assert fields["vector"] == {"FieldName": "vector", "FieldType": "vector", "Dim": 1024}
     assert fields["uri"]["FieldType"] == "path"
     assert {"uri", "account_id", "owner_user_id"}.issubset(schema["ScalarIndex"])
+
+
+def test_vectordb_config_payload_ignores_unrelated_model_config(tmp_path):
+    payload = benchmark.vectordb_config_payload(
+        {
+            "storage": {
+                "workspace": str(tmp_path / "data"),
+                "vectordb": {
+                    "backend": "cuvs",
+                    "name": "benchmark",
+                    "cuvs": {"algorithm": "brute_force"},
+                },
+            },
+            "embedding": {"dense": {"provider": "not-installed-for-this-benchmark"}},
+            "vlm": {"provider": "not-installed-for-this-benchmark"},
+        }
+    )
+
+    assert payload == {
+        "backend": "cuvs",
+        "name": "benchmark",
+        "cuvs": {"algorithm": "brute_force"},
+        "path": str((tmp_path / "data").resolve()),
+    }
+
+
+def test_vectordb_config_payload_rejects_non_object_storage():
+    with pytest.raises(ValueError, match="storage config must be an object"):
+        benchmark.vectordb_config_payload({"storage": []})
